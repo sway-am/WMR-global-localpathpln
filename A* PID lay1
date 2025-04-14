@@ -1,0 +1,325 @@
+%% A* Global Planning + Path Smoothing + Path Subsampling + PID Local Path Following
+clear; clc; close all;
+global collisionCheckCounter; 
+collisionCheckCounter = 0;  % Initialize collision check counter
+
+%% ============== Environment Setup ==============
+gridSize = [50,50];              % Grid dimensions
+grid_static = zeros(gridSize);   % 0 = free, 1 = obstacle
+
+% Outer walls
+grid_static(1,:) = 1;        % Top wall
+grid_static(50,:) = 1;       % Bottom wall
+grid_static(:,1) = 1;        % Left wall
+grid_static(:,50) = 1;       % Right wall
+
+% Horizontal shelf rows with gaps
+grid_static(8:10, 5:15)   = 1;    % Shelf row 1, segment 1
+grid_static(8:10, 25:35)  = 1;    % Shelf row 1, segment 2
+grid_static(18:20, 5:15)  = 1;    % Shelf row 2, segment 1
+grid_static(18:20, 25:35) = 1;    % Shelf row 2, segment 2
+grid_static(28:30, 10:20) = 1;    % Shelf row 3, segment 1
+grid_static(28:30, 30:40) = 1;    % Shelf row 3, segment 2
+grid_static(38:40, 5:15)  = 1;    % Shelf row 4, segment 1
+grid_static(38:40, 25:35) = 1;    % Shelf row 4, segment 2
+
+% Additional vertical shelf obstacles
+grid_static(12:22, 40:42) = 1;
+grid_static(30:40, 10:12) = 1;
+
+%% ============== Global A* Planning ==============
+start_cell = [2, 2];       % Starting grid cell [x,y]
+goal_cell  = [45, 45];     % Goal grid cell [x,y]
+
+% Run A* Global Planner to get a raw global path (waypoints)
+rawGlobalPath = aStarPlanner(grid_static, start_cell, goal_cell);
+if isempty(rawGlobalPath)
+    error('No path found by A* planner.');
+else
+    disp('Raw global path found:');
+    disp(rawGlobalPath);
+end
+
+%% ============== Path Smoothing ==================
+% Smooth the raw global path (optional)
+smoothGlobalPath = smoothPathACO(rawGlobalPath, grid_static);
+disp('Smoothed global path:');
+disp(smoothGlobalPath);
+
+%% ============== Path Subsampling ==================
+% To reduce complexity for the local controller, choose every 7th waypoint.
+reducedGlobalPath = subsamplePath(smoothGlobalPath, 1);
+disp('Reduced global path (subsampled):');
+disp(reducedGlobalPath);
+
+%% ============== Local PID Controller Parameters ==============
+% PID parameters for heading control
+Kp_heading = 1.5;
+Ki_heading = 0.0;
+Kd_heading = 0.2;
+
+% Gain for linear speed control
+Kp_distance = 0.5;
+max_v = 1.0;  % Maximum linear velocity
+
+dt = 0.1;     % Time step [s]
+
+% Tolerance for switching waypoints
+waypointTolerance = 2.0;  % in grid units
+
+%% ============== Bot Initialization ==============
+% The robot state is defined as [x, y, theta]
+bot.state = [start_cell(1), start_cell(2), 0];
+bot.trajectory = bot.state(1:2);
+
+%% ============== Metrics Initialization ==============
+metrics.time_to_goal = NaN;
+metrics.total_distance = 0;
+metrics.optimal_distance = norm(goal_cell - start_cell);
+metrics.cumulative_heading_change = 0;
+
+max_iterations = 1500;  % Maximum iterations for simulation
+iter = 1;               % Iteration counter
+sim_start = tic;        % Start simulation timer
+
+%% ============== Simulation Loop: Follow Reduced Global Path using PID ==============
+wp_index = 2;  % start from second point (first is start)
+prev_heading_error = 0;
+int_heading_error = 0;
+
+figure;
+while iter <= max_iterations
+    % Get current target waypoint from reduced global path
+    current_goal = reducedGlobalPath(wp_index, :);
+    
+    % Compute errors:
+    pos = bot.state(1:2);
+    distance_error = norm(current_goal - pos);
+    desired_heading = atan2(current_goal(2) - pos(2), current_goal(1) - pos(1));
+    heading_error = wrapToPi(desired_heading - bot.state(3));
+    
+    % Check if current waypoint reached (using tolerance)
+    if distance_error < waypointTolerance
+        if wp_index < size(reducedGlobalPath,1)
+            wp_index = wp_index + 1;
+            current_goal = reducedGlobalPath(wp_index, :);
+            % Reset PID integrator for heading when switching waypoints
+            int_heading_error = 0;
+            prev_heading_error = 0;
+        else
+            % Final goal reached
+            metrics.time_to_goal = iter * dt;
+            disp(['Final goal reached at time ' num2str(metrics.time_to_goal) ' seconds.']);
+            break;
+        end
+    end
+    
+    % PID for heading control:
+    d_heading = (heading_error - prev_heading_error) / dt;
+    int_heading_error = int_heading_error + heading_error * dt;
+    omega = Kp_heading * heading_error + Ki_heading * int_heading_error + Kd_heading * d_heading;
+    prev_heading_error = heading_error;
+    
+    % Linear speed control based on distance error (saturate at max_v)
+    v = min(Kp_distance * distance_error, max_v);
+    
+    % Update robot state using simple kinematics
+    prev_state = bot.state;
+    bot.state(1) = bot.state(1) + v * cos(bot.state(3)) * dt;
+    bot.state(2) = bot.state(2) + v * sin(bot.state(3)) * dt;
+    bot.state(3) = bot.state(3) + omega * dt;
+    bot.trajectory = [bot.trajectory; bot.state(1:2)];
+    
+    % Update metrics
+    metrics.total_distance = metrics.total_distance + norm(bot.state(1:2) - prev_state(1:2));
+    metrics.cumulative_heading_change = metrics.cumulative_heading_change + abs(heading_error);
+    
+    %% Visualization
+    clf;
+    imagesc(flipud(grid_static));
+    title('A* Global Path, PID Path Following');
+    colormap(gray);
+    hold on;
+    % Plot the reduced global path
+    plot(reducedGlobalPath(:,1), gridSize(1) - reducedGlobalPath(:,2) + 1, 'b.-', 'MarkerSize', 15);
+    % Plot the robot trajectory
+    plot(bot.trajectory(:,1), gridSize(1) - bot.trajectory(:,2) + 1, 'r-', 'LineWidth', 2);
+    % Plot the current robot position
+    plot(bot.state(1), gridSize(1)-bot.state(2)+1, 'ro', 'MarkerSize', 10, 'LineWidth', 2);
+    % Plot current waypoint
+    plot(current_goal(1), gridSize(1)-current_goal(2)+1, 'gx', 'MarkerSize', 12, 'LineWidth', 2);
+    axis([0.5 gridSize(2)+0.5 0.5 gridSize(1)+0.5]);
+    axis equal; hold off;
+    drawnow;
+    
+    iter = iter + 1;
+end
+
+total_sim_time = toc(sim_start);
+metrics.path_efficiency = metrics.total_distance / metrics.optimal_distance;
+
+%% Metrics Post-Processing
+disp('--- Simulation Metrics ---');
+fprintf('Time to final goal: %.2f seconds\n', metrics.time_to_goal);
+fprintf('Total distance traveled: %.2f\n', metrics.total_distance);
+fprintf('Path efficiency (ratio): %.2f\n', metrics.path_efficiency);
+fprintf('Cumulative heading change: %.2f radians\n', metrics.cumulative_heading_change);
+fprintf('Total simulation time: %.2f seconds\n', total_sim_time);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ============== A* Global Path Planner Function ==============
+function path = aStarPlanner(grid, start_cell, goal_cell)
+    % aStarPlanner implements a simple A* search on a 2D grid.
+    % Cells with value 1 are obstacles.
+    %
+    % Inputs:
+    %   grid       - binary grid (0 free, 1 obstacle)
+    %   start_cell - [x,y] starting cell (integer coordinates)
+    %   goal_cell  - [x,y] goal cell (integer coordinates)
+    %
+    % Output:
+    %   path - an N-by-2 matrix of [x,y] waypoints from start to goal
+    
+    [rows, cols] = size(grid);
+    
+    % Initialize open and closed lists
+    openList = [];  % each row: [x, y, f, g, h, parent_index]
+    closedList = zeros(rows, cols);
+    
+    % Heuristic function: Euclidean distance
+    heuristic = @(cell) norm(cell - goal_cell);
+    
+    % Start node: [x, y, f, g, h, parent]
+    startNode = [start_cell, heuristic(start_cell), 0, heuristic(start_cell), -1];
+    openList = [openList; startNode];
+    
+    allNodes = startNode; % store all nodes (for parent pointers)
+    
+    % 8-connected moves
+    moves = [ -1, -1; -1, 0; -1, 1;
+               0, -1;         0, 1;
+               1, -1;  1, 0;  1, 1];
+           
+    found = false;
+    while ~isempty(openList)
+        % Get node with smallest f value
+        [~, idx] = min(openList(:,3));
+        current = openList(idx, :);
+        openList(idx, :) = [];  % remove from open list
+        x = current(1); y = current(2);
+        closedList(y, x) = 1;
+        allNodes(end+1,:) = current;
+        current_index = size(allNodes,1);
+        
+        % Check if goal is reached (within 1 cell)
+        if norm([x, y] - goal_cell) < 1.0
+            found = true;
+            break;
+        end
+        
+        % Explore neighbors
+        for i = 1:size(moves,1)
+            neighbor = [x, y] + moves(i,:);
+            nx = neighbor(1); ny = neighbor(2);
+            % Skip out-of-bound or obstacle or already closed
+            if nx < 1 || nx > cols || ny < 1 || ny > rows, continue; end
+            if grid(ny, nx) == 1 || closedList(ny, nx) == 1, continue; end
+            
+            g_new = current(4) + norm(moves(i,:)); % cost from start to neighbor
+            h_new = heuristic([nx, ny]);
+            f_new = g_new + h_new;
+            
+            % Check if neighbor is in open list with a lower cost
+            inOpen = false;
+            for j = 1:size(openList,1)
+                if openList(j,1)==nx && openList(j,2)==ny
+                    inOpen = true;
+                    if g_new < openList(j,4)
+                        openList(j,4) = g_new;
+                        openList(j,3) = f_new;
+                        openList(j,5) = h_new;
+                        openList(j,6) = current_index;
+                    end
+                    break;
+                end
+            end
+            if ~inOpen
+                newNode = [nx, ny, f_new, g_new, h_new, current_index];
+                openList = [openList; newNode];
+            end
+        end
+    end
+    
+    % Reconstruct path from goal to start if found
+    if found
+        path = [goal_cell];
+        node_index = current_index;
+        while node_index ~= -1
+            node = allNodes(node_index,:);
+            path = [node(1:2); path]; %#ok<AGROW>
+            node_index = node(6);
+        end
+    else
+        path = [];
+    end
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ============== Path Smoothing Function ==============
+function newPath = smoothPathACO(path, grid)
+    % Iterative smoothing to reduce curvature while staying close to the original path.
+    weight_data = 0.6;   % fidelity to original path
+    weight_smooth = 0.1; % smoothing factor
+    tolerance = 1e-4;    % convergence threshold
+    max_iter = 1000;
+    
+    newPath = path;
+    change = Inf;
+    iter = 0;
+    while change > tolerance && iter < max_iter
+        change = 0;
+        iter = iter + 1;
+        for i = 2:size(path,1)-1
+            oldVal = newPath(i,:);
+            newPath(i,:) = newPath(i,:) + weight_data*(path(i,:) - newPath(i,:)) + ...
+                           weight_smooth*(newPath(i-1,:) + newPath(i+1,:) - 2*newPath(i,:));
+            change = change + norm(newPath(i,:) - oldVal);
+            % Optional: if smoothing creates collision, revert
+            if checkCollision(newPath(i,:), grid, 0)
+                newPath(i,:) = oldVal;
+            end
+        end
+    end
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ============== Path Subsampling Function ==============
+function reducedPath = subsamplePath(path, step)
+    % Subsample the path by choosing every "step" point.
+    reducedPath = path(1:step:end, :);
+    if ~isequal(reducedPath(end,:), path(end,:))
+        reducedPath(end+1,:) = path(end,:);
+    end
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% ============== Collision Check Function ==============
+function collision = checkCollision(pos, grid, robot_radius)
+    global collisionCheckCounter;
+    collisionCheckCounter = collisionCheckCounter + 1;
+    [rows, cols] = size(grid);
+    x = pos(1); y = pos(2);
+    if (x < 1) || (x > cols) || (y < 1) || (y > rows)
+        collision = true;
+        return;
+    end
+    [obs_rows, obs_cols] = find(grid==1);
+    collision = false;
+    for k = 1:length(obs_cols)
+        cell_center = [obs_cols(k), obs_rows(k)];
+        if norm(pos - cell_center) <= (robot_radius + 0.5)
+            collision = true;
+            return;
+        end
+    end
+end
