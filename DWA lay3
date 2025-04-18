@@ -1,0 +1,331 @@
+%% Single Bot Simulation in a Warehouse Environment using Simple DWA (Metrics Evaluation)
+clear; clc; close all;
+global collisionCheckCounter; 
+collisionCheckCounter = 0;  % Initialize collision check counter
+
+%% Environment Setup - Bigger & More Complex Warehouse Layout
+% Fixed Complicated Layout (51x51 Grid)
+gridSize = [51, 51];  % Grid dimensions: 51x51 (outer boundaries are obstacles)
+% Initialize grid: fill with obstacles, then carve free space interior
+grid_static = ones(gridSize);    % 1 = obstacle, 0 = free
+grid_static(2:50,2:50) = 0;       % Free interior
+
+% Fixed horizontal walls with openings
+grid_static(10, 2:12)  = 1;     
+grid_static(15,25:50)  = 1;   
+grid_static(20, 5:18)  = 1;   
+grid_static(25,15:48)  = 1;   grid_static(25,35:40)  = 0;   % Wall at row 25 with passage at column 35
+grid_static(30, 5:25)  = 1;   grid_static(30,15:18)  = 0;   % Wall at row 30 with passage at column 15
+grid_static(35,30:50)  = 1;   grid_static(35,40:43)  = 0;   % Wall at row 35 with passage at column 40
+grid_static(40, 2:40)  = 1;   grid_static(40,10:15)  = 0;   % Wall at row 40 with passage at column 20
+grid_static(45,15:35)  = 1;   grid_static(45,20:30)  = 0;   % Wall at row 45 with passage at column 25
+
+% Fixed vertical walls with openings
+grid_static(2:10, 20) = 1;
+grid_static(10:25, 10)  = 1;   grid_static(2:5,10)  = 0;   % Vertical wall at column 10 with opening at row 12
+grid_static(25:50, 30) = 1;   grid_static(40,30)  = 0;   % Vertical wall at column 30 with opening at row 40
+
+% Extra block obstacle for additional complexity
+grid_static(28:32, 20) = 1;   grid_static(30,20)  = 0;   % Block with a passage at row 30, column 20
+
+%% Global Occupancy Map Initialization (for mapping static obstacles only)
+global_map = zeros(gridSize);  % 0 = free, 1 = occupied
+
+%% Define Dynamic (Moving) Obstacles
+% Define moving obstacles that change position over time.
+movingObstacles(1).pos = [10, 40];      % [x, y] initial position
+movingObstacles(1).vel = [0.9, 0];        % velocity vector [vx, vy]
+
+movingObstacles(2).pos = [17, 10];
+movingObstacles(2).vel = [-0.03, 0];
+
+%% Initialize Dynamic Obstacles Grid (Updated each iteration)
+grid_dynamic = zeros(gridSize);
+
+%% Robot and Simulation Parameters
+params.max_v = 1.0;              % Maximum linear velocity [m/s]
+params.max_omega = 1.0;          % Maximum angular velocity [rad/s]
+params.dt = 0.1;                 % Time step [s]
+params.predict_time = 3.0;       % Prediction horizon [s]
+params.velocity_resolution = 0.1;
+params.omega_resolution = 0.1;
+params.robot_radius = 0.5;
+
+lidar.angles = -pi/3 : pi/36 : pi/3;
+lidar.max_range = 7;  % Sensing range
+
+goal_reached_threshold = 0.5;    % Distance to consider the goal reached
+
+%% Single Bot Setup
+bots = struct([]);
+bots(1).state = [2, 2, 0];         % Starting [x, y, theta]
+bots(1).main_goal = [45, 45];       % Goal position
+bots(1).trajectory = bots(1).state(1:2);
+bots(1).color = 'r';
+bots(1).finished = false;           % flag to stop when goal reached
+
+%% Metrics Initialization
+metrics.bot.time_to_goal = NaN;         % simulation time when goal reached
+metrics.bot.total_distance = 0;           % total distance traveled along trajectory
+metrics.bot.optimal_distance = norm(bots(1).main_goal - bots(1).trajectory(1,:));
+metrics.bot.cumulative_heading_change = 0; % total heading change (in radians)
+
+total_iterations = 0;
+sim_start = tic;  % Start overall simulation timer
+
+max_iterations = 1500;  % Maximum iterations
+
+%% Simulation Loop
+figure;
+for iter = 1:max_iterations
+    iteration_start = tic; % Start timer for this iteration
+    total_iterations = iter;
+    
+    %% Update Dynamic Obstacles
+    grid_dynamic = zeros(gridSize);  % Reset dynamic obstacles grid
+    for idx = 1:length(movingObstacles)
+        % Update obstacle position
+        movingObstacles(idx).pos = movingObstacles(idx).pos + movingObstacles(idx).vel * params.dt;
+        % Reflect obstacles at grid boundaries
+        if movingObstacles(idx).pos(1) < 1 || movingObstacles(idx).pos(1) > gridSize(2)
+            movingObstacles(idx).vel(1) = -movingObstacles(idx).vel(1);
+            movingObstacles(idx).pos(1) = min(max(movingObstacles(idx).pos(1), 1), gridSize(2));
+        end
+        if movingObstacles(idx).pos(2) < 1 || movingObstacles(idx).pos(2) > gridSize(1)
+            movingObstacles(idx).vel(2) = -movingObstacles(idx).vel(2);
+            movingObstacles(idx).pos(2) = min(max(movingObstacles(idx).pos(2), 1), gridSize(1));
+        end
+        % Mark the dynamic obstacle in the dynamic grid
+        row = round(movingObstacles(idx).pos(2));
+        col = round(movingObstacles(idx).pos(1));
+        grid_dynamic(row, col) = 1;
+    end
+    
+    %% Combined grid: consider dynamic obstacles for planning and visualization
+    grid_combined_all = max(grid_static, grid_dynamic);
+    
+    %% Update Global Occupancy Map based on Sensor Readings
+    % We update our global map using only the static grid to avoid permanent marks
+    lidar_ranges = simulateLidar(bots(1).state, grid_static, lidar.angles, lidar.max_range);
+    for j = 1:length(lidar.angles)
+        angle = bots(1).state(3) + lidar.angles(j);
+        distance = lidar_ranges(j);
+        pos_hit = bots(1).state(1:2) + distance*[cos(angle), sin(angle)];
+        row = round(pos_hit(2));
+        col = round(pos_hit(1));
+        if row >= 1 && row <= gridSize(1) && col >= 1 && col <= gridSize(2)
+            if distance < lidar.max_range
+                global_map(row, col) = 1;
+            else
+                global_map(row, col) = 0;
+            end
+        end
+    end
+    
+    %% Combine Global Map with Combined Grid for Informed Planning
+    informed_grid = max(grid_combined_all, global_map);
+    
+    %% Update Bot using Simple DWA (Only local planning)
+    if bots(1).finished
+        continue;  % Skip update if goal reached.
+    end
+    
+    % Check if the goal has been reached
+    if norm(bots(1).state(1:2) - bots(1).main_goal) < goal_reached_threshold
+        bots(1).finished = true;
+        metrics.bot.time_to_goal = iter * params.dt;
+        disp(['Goal reached at time ' num2str(metrics.bot.time_to_goal) ' seconds.']);
+        continue;
+    end
+    
+    % Set current goal as the main goal
+    current_goal = bots(1).main_goal;
+    
+    % Compute local control command using simple DWA
+    [v, omega] = dwa(bots(1).state, informed_grid, current_goal, params);
+    
+    % Record metrics before updating state
+    prev_state = bots(1).state;
+    
+    % Update robot state using simple kinematics
+    bots(1).state(1) = bots(1).state(1) + v * cos(bots(1).state(3)) * params.dt;
+    bots(1).state(2) = bots(1).state(2) + v * sin(bots(1).state(3)) * params.dt;
+    bots(1).state(3) = bots(1).state(3) + omega * params.dt;
+    bots(1).trajectory = [bots(1).trajectory; bots(1).state(1:2)];
+    
+    % Update distance and heading change metrics
+    metrics.bot.total_distance = metrics.bot.total_distance + norm(bots(1).state(1:2) - prev_state(1:2));
+    heading_change = abs(angdiff(bots(1).state(3), prev_state(3)));
+    metrics.bot.cumulative_heading_change = metrics.bot.cumulative_heading_change + heading_change;
+    
+    %% Visualization
+    clf;
+    subplot(1,2,1);
+    imagesc(flipud(global_map));
+    title('Global Occupancy Map');
+    colormap(gray);
+    axis equal;
+    axis([0.5 gridSize(2)+0.5 0.5 gridSize(1)+0.5]);
+    
+    subplot(1,2,2);
+    imagesc(flipud(max(grid_static, global_map)));
+    title('Simulation Environment');
+    colormap(gray);
+    hold on;
+    
+    % Plot dynamic obstacles as blue squares (from grid_dynamic)
+    for idx = 1:length(movingObstacles)
+        pos = movingObstacles(idx).pos;
+        plot(pos(1), gridSize(1)-pos(2)+1, 'bs', 'MarkerSize', 10, 'MarkerFaceColor', 'b');
+    end
+    
+    % Plot the robot's trajectory, current position, and goal
+    plot(bots(1).trajectory(:,1), gridSize(1) - bots(1).trajectory(:,2) + 1, [bots(1).color '-'], 'LineWidth', 2);
+    plot(bots(1).state(1), gridSize(1)-bots(1).state(2)+1, [bots(1).color 'o'], 'MarkerSize', 10, 'LineWidth', 2);
+    plot(bots(1).main_goal(1), gridSize(1)-bots(1).main_goal(2)+1, [bots(1).color 'x'], 'MarkerSize', 10, 'LineWidth', 2);
+    
+    % Plot LIDAR rays using the combined grid (so rays hit dynamic obstacles)
+    lidar_ranges = simulateLidar(bots(1).state, grid_combined_all, lidar.angles, lidar.max_range);
+    for j = 1:length(lidar.angles)
+        angle = bots(1).state(3) + lidar.angles(j);
+        endPt = bots(1).state(1:2) + lidar_ranges(j)*[cos(angle), sin(angle)];
+        plot([bots(1).state(1) endPt(1)], [gridSize(1)-bots(1).state(2)+1 gridSize(1)-endPt(2)+1], 'r-');
+    end
+    axis([0.5 gridSize(2)+0.5 0.5 gridSize(1)+0.5]);
+    axis equal;
+    hold off;
+    drawnow;
+    
+    % (Optional) Record computation time per iteration
+    iter_time(iter) = toc(iteration_start);
+end
+
+total_sim_time = toc(sim_start);
+
+%% Metrics Post-Processing
+metrics.bot.path_efficiency = metrics.bot.total_distance / metrics.bot.optimal_distance;
+disp('--- Simulation Metrics ---');
+fprintf('Time to goal: %.2f seconds\n', metrics.bot.time_to_goal);
+fprintf('Total distance traveled: %.2f\n', metrics.bot.total_distance);
+fprintf('Path efficiency (ratio): %.2f\n', metrics.bot.path_efficiency);
+fprintf('Cumulative heading change: %.2f radians\n', metrics.bot.cumulative_heading_change);
+fprintf('Total simulation time: %.2f seconds\n', total_sim_time);
+
+%% --- Helper Functions ---
+function [best_v, best_omega] = dwa(state, grid, goal, params)
+    % Simple DWA: Evaluate the trajectory for all discretized (v, omega) pairs.
+    best_cost = Inf;
+    best_v = 0;
+    best_omega = 0;
+    for v = 0:params.velocity_resolution:params.max_v
+        for omega = -params.max_omega:params.omega_resolution:params.max_omega
+            cost = evaluateTrajectory(state, v, omega, grid, goal, params);
+            if cost < best_cost
+                best_cost = cost;
+                best_v = v;
+                best_omega = omega;
+            end
+        end
+    end
+end
+
+function cost = evaluateTrajectory(state, v, omega, grid, goal, params)
+    t = 0:params.dt:params.predict_time;
+    traj = zeros(length(t), 3);
+    traj(1,:) = state;
+    collision = false;
+    for i = 2:length(t)
+        traj(i,1) = traj(i-1,1) + v * cos(traj(i-1,3)) * params.dt;
+        traj(i,2) = traj(i-1,2) + v * sin(traj(i-1,3)) * params.dt;
+        traj(i,3) = traj(i-1,3) + omega * params.dt;
+        if checkCollision(traj(i,1:2), grid, params.robot_radius)
+            collision = true;
+            break;
+        end
+    end
+    if collision
+        cost = Inf;
+        return;
+    end
+    goal_cost = norm(traj(end,1:2) - goal);
+    desired_heading = atan2(goal(2)-traj(end,2), goal(1)-traj(end,1));
+    heading_cost = abs(angdiff(traj(end,3), desired_heading));
+    velocity_cost = (params.max_v - v);
+    
+    safe_distance = 1.5;
+    min_clearance = Inf;
+    for i = 1:size(traj,1)
+        clearance = computeClearance(traj(i,1:2), grid);
+        if clearance < min_clearance
+            min_clearance = clearance;
+        end
+    end
+    if min_clearance < safe_distance
+        clearance_cost = (safe_distance - min_clearance);
+    else
+        clearance_cost = 0;
+    end
+    
+    % Weights for the cost components
+    w_goal = 0.1;
+    w_heading = 0.02;
+    w_vel = 0.3;
+    w_clearance = 0.8;
+    
+    cost = w_goal * goal_cost + w_heading * heading_cost + w_vel * velocity_cost + w_clearance * clearance_cost;
+end
+
+function clearance = computeClearance(pos, grid)
+    [obs_rows, obs_cols] = find(grid==1);
+    if isempty(obs_rows)
+        clearance = Inf;
+        return;
+    end
+    dists = sqrt((obs_cols - pos(1)).^2 + (obs_rows - pos(2)).^2);
+    clearance = min(dists) - 0.5;
+end
+
+function collision = checkCollision(pos, grid, robot_radius)
+    global collisionCheckCounter; 
+    collisionCheckCounter = collisionCheckCounter + 1;
+    
+    [rows, cols] = size(grid);
+    x = pos(1); y = pos(2);
+    if (x < 1) || (x > cols) || (y < 1) || (y > rows)
+        collision = true;
+        return;
+    end
+    [obs_rows, obs_cols] = find(grid==1);
+    collision = false;
+    for k = 1:length(obs_cols)
+        cell_center = [obs_cols(k), obs_rows(k)];
+        if norm(pos - cell_center) <= (robot_radius + 0.5)
+            collision = true;
+            return;
+        end
+    end
+end
+
+function distances = simulateLidar(state, grid, angles, max_range)
+    pos = state(1:2);
+    distances = zeros(size(angles));
+    delta = 0.1;
+    for i = 1:length(angles)
+        angle = state(3) + angles(i);
+        distance = 0;
+        hit = false;
+        while ~hit && distance < max_range
+            distance = distance + delta;
+            test_point = pos + distance * [cos(angle), sin(angle)];
+            if checkCollision(test_point, grid, 0)
+                hit = true;
+            end
+        end
+        distances(i) = distance;
+    end
+end
+
+function diff = angdiff(angle1, angle2)
+    % Compute the minimal difference between two angles
+    diff = mod(angle1 - angle2 + pi, 2*pi) - pi;
+end
